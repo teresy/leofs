@@ -95,7 +95,7 @@ handle_call({unlock, FileHandler, Owner, Start, End}, _From, State) ->
                                                    [] ->
                                                        Acc;
                                                    Modified ->
-                                                       lists:append(Acc, Modified)
+                                                       Acc ++ Modified
                                                end;
                                            _ ->
                                                [CurLock | Acc]
