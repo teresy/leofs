@@ -2,7 +2,7 @@
 %%
 %% LeoStorage
 %%
-%% Copyright (c) 2012-2017 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -75,8 +75,6 @@ start(RefSup, RootPath) ->
             false -> RootPath ++ ?SLASH
         end,
 
-    ?TBL_REBALANCE_COUNTER = ets:new(?TBL_REBALANCE_COUNTER,
-                                     [named_table, public, {read_concurrency, true}]),
     DelBucketQueues = ?del_dir_queue_list(),
     start_1([{?QUEUE_ID_PER_OBJECT,        ?MSG_PATH_PER_OBJECT},
              {?QUEUE_ID_SYNC_BY_VNODE_ID,  ?MSG_PATH_SYNC_VNODE_ID},
@@ -250,14 +248,6 @@ publish(?QUEUE_ID_REBALANCE = Id, Node, VNodeId, AddrId, Key) ->
                                               key = Key,
                                               node = Node,
                                               timestamp = leo_date:now()}),
-            Table = ?TBL_REBALANCE_COUNTER,
-            case ets_lookup(Table, VNodeId) of
-                {ok, 0} ->
-                    ets:insert(Table, {VNodeId, 0});
-                _Other ->
-                    void
-            end,
-            ok = increment_counter(Table, VNodeId),
             leo_mq_api:publish(Id, KeyBin, MessageBin)
     end;
 
@@ -381,8 +371,7 @@ handle_call({consume, ?QUEUE_ID_SYNC_BY_VNODE_ID, MessageBin}) ->
             {ok, Res} = leo_redundant_manager_api:range_of_vnodes(ToVNodeId),
             {ok, {CurRingHash, _PrevRingHash}} =
                 leo_redundant_manager_api:checksum(?CHECKSUM_RING),
-            ok = sync_vnodes(Node, CurRingHash, Res),
-            notify_rebalance_message_to_manager(ToVNodeId);
+            ok = sync_vnodes(Node, CurRingHash, Res);
         _ ->
             ?warn("handle_call/1 - consume",
                   [{qid, ?QUEUE_ID_SYNC_BY_VNODE_ID},
@@ -415,6 +404,8 @@ handle_call({consume, ?QUEUE_ID_RECOVERY_NODE, MessageBin}) ->
         #recovery_node_message{node = NodeAndDisk} when is_tuple(NodeAndDisk) ->
             {Node, Disk} = NodeAndDisk,
             recover_disk(Node, Disk);
+        #recovery_node_message{node = none} ->
+            recover_consistency();
         #recovery_node_message{node = Node} ->
             recover_node(Node);
         _ ->
@@ -503,6 +494,25 @@ recover_disk(Node, Disk) ->
     Callback = recover_node_callback(Node),
     _ = leo_object_storage_api:fetch_by_addr_id_and_disk(0, Disk, Callback),
     ok.
+
+%% @private
+-spec(recover_consistency() ->
+             ok).
+recover_consistency() ->
+    Callback = recover_consistency_callback(),
+    _ = leo_object_storage_api:fetch_by_addr_id(0, Callback),
+    ok.
+
+%% @private
+-spec(recover_consistency_callback() ->
+             any()).
+recover_consistency_callback() ->
+    fun(_K, V, _Acc) ->
+            Metadata_1 = binary_to_term(V),
+            Metadata_2 = leo_object_storage_transformer:transform_metadata(Metadata_1),
+            ?MODULE:publish(?QUEUE_ID_PER_OBJECT,
+                            Metadata_2, ?ERR_TYPE_RECOVER_DATA)
+    end.
 
 %% @private
 -spec(recover_node(Node) ->
@@ -905,12 +915,10 @@ correct_redundancies_4({error, Why}, InconsistentNodes, [Node|Rest], Metadata) -
 %%          this function cannot operate 'copy'.
 %% @private
 rebalance_1(#rebalance_message{node = Node,
-                               vnode_id = VNodeId,
                                addr_id = AddrId,
                                key = Key} = Msg) ->
     case leo_redundant_manager_api:get_member_by_node(Node) of
         {ok, #member{state = ?STATE_RUNNING}} ->
-            ok = decrement_counter(?TBL_REBALANCE_COUNTER, VNodeId),
 
             case leo_redundant_manager_api:get_redundancies_by_key(Key) of
                 {ok, #redundancies{nodes = Redundancies}} ->
@@ -980,44 +988,6 @@ get_redundancies_with_replicas(AddrId, Key, Redundancies) ->
     end.
 
 
-%% @doc Notify a rebalance-progress messages to manager.
-%%      - Retrieve # of published messages for rebalance,
-%%        after notify a message to manager.
-%%
--spec(notify_rebalance_message_to_manager(integer()) ->
-             ok | {error, any()}).
-notify_rebalance_message_to_manager(VNodeId) ->
-    case ets_lookup(?TBL_REBALANCE_COUNTER, VNodeId) of
-        {ok, NumOfMessages} ->
-            Fun = fun(_Manager, true) ->
-                          void;
-                     (Manager0, false = Res) ->
-                          Manager1 = case is_atom(Manager0) of
-                                         true  -> Manager0;
-                                         false -> list_to_atom(Manager0)
-                                     end,
-                          case catch rpc:call(Manager1, leo_manager_api, notify,
-                                              [rebalance, VNodeId,
-                                               erlang:node(), NumOfMessages],
-                                              ?DEF_REQ_TIMEOUT) of
-                              ok ->
-                                  true;
-                              {_, Cause} ->
-                                  ?error("notify_rebalance_message_to_manager/1",
-                                         [{manager, Manager1},
-                                          {vnode_id, VNodeId}, {cause, Cause}]),
-                                  Res;
-                              timeout ->
-                                  Res
-                          end
-                  end,
-            lists:foldl(Fun, false, ?env_manager_nodes(leo_storage)),
-            ok;
-        Error ->
-            Error
-    end.
-
-
 %% @doc Fix consistency of an object between a local-cluster and remote-cluster(s)
 %% @private
 -spec(fix_consistency_between_clusters(InconsistentData) ->
@@ -1030,7 +1000,8 @@ fix_consistency_between_clusters(#inconsistent_data_with_dc{
     case leo_storage_handler_object:get(AddrId, Key, -1) of
         {ok, Metadata, Bin} ->
             Object = leo_object_storage_transformer:metadata_to_object(Metadata),
-            leo_sync_remote_cluster:defer_stack(Object#?OBJECT{data = Bin});
+            leo_sync_remote_cluster:defer_stack(Object#?OBJECT{data = Bin,
+                                                               meta = term_to_binary([{?PROP_CMETA_UDM, binary_to_term(Metadata#?METADATA.meta)}])});
         _ ->
             ok
     end;
@@ -1124,42 +1095,3 @@ compare_between_metadatas(#?METADATA{addr_id = AddrId,
             {error, ?ERROR_COULD_NOT_GET_META}
     end.
 
-
-%%--------------------------------------------------------------------
-%% INNTERNAL FUNCTIONS-2 ETS related functions
-%%--------------------------------------------------------------------
-%% @doc Lookup rebalance counter
-%% @private
--spec(ets_lookup(Table, Key) ->
-             {ok, Value} | {error, Cause} when Table::atom(),
-                                               Key::binary(),
-                                               Value::integer(),
-                                               Cause::any()).
-ets_lookup(Table, Key) ->
-    case catch ets:lookup(Table, Key) of
-        [] ->
-            {ok, 0};
-        [{_Key, Value}] ->
-            {ok, Value};
-        {'EXIT', Cause} ->
-            {error, Cause}
-    end.
-
-
-%% @doc Increment rebalance counter
-%% @private
--spec(increment_counter(Table, Key) ->
-             ok when Table::atom(),
-                     Key::binary()).
-increment_counter(Table, Key) ->
-    catch ets:update_counter(Table, Key, 1),
-    ok.
-
-%% @doc Decrement rebalance counter
-%% @private
--spec(decrement_counter(Table, Key) ->
-             ok when Table::atom(),
-                     Key::binary()).
-decrement_counter(Table, Key) ->
-    catch ets:update_counter(Table, Key, -1),
-    ok.

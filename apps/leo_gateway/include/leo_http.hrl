@@ -1,8 +1,8 @@
 %%======================================================================
 %%
-%% Leo S3 HTTP
+%% Leo Gateway / S3 HTTP
 %%
-%% Copyright (c) 2012-2015 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -75,6 +75,7 @@
 -define(HTTP_HRAD_X_AMZ_DATE,                   <<"x-amz-date">>).
 -define(HTTP_HEAD_X_AMZ_META_DIRECTIVE_COPY,    <<"COPY">>).
 -define(HTTP_HEAD_X_AMZ_META_DIRECTIVE_REPLACE, <<"REPLACE">>).
+-define(HTTP_HEAD_X_AMZ_LEOFS_FROM_CACHE,       <<"x-amz-meta-leofs-from-cache">>).
 -define(HTTP_HEAD_X_FROM_CACHE,                 <<"x-from-cache">>).
 
 
@@ -100,7 +101,9 @@
 -define(HTTP_QS_BIN_MULTI_DELETE,<<"delete">>).
 -define(HTTP_QS_BIN_DELIMITER,   <<"delimiter">>).
 -define(HTTP_QS_BIN_VERSIONING,  <<"versioning">>).
+-define(HTTP_QS_BIN_VERSIONS,    <<"versions">>).
 -define(HTTP_QS_BIN_LOCATION,    <<"location">>).
+-define(HTTP_QS_BIN_TAGGING,     <<"tagging">>).
 
 -define(HTTP_ST_OK,                  200).
 -define(HTTP_ST_NO_CONTENT,          204).
@@ -171,6 +174,8 @@
 -define(XML_ERROR_CODE_SignatureDoesNotMatch, "SignatureDoesNotMatch").
 -define(XML_ERROR_CODE_RequestTimeTooSkewed, "RequestTimeTooSkewed").
 -define(XML_ERROR_CODE_MetadataTooLarge, "MetadataTooLarge").
+-define(XML_ERROR_CODE_InvalidPart, "InvalidPart").
+-define(XML_ERROR_CODE_NoSuchUpload, "NoSuchUpload").
 
 %% error messages used in a error response
 -define(XML_ERROR_MSG_EntityTooLarge, "Your proposed upload exceeds the maximum allowed object size.").
@@ -191,6 +196,8 @@
 -define(XML_ERROR_MSG_SignatureDoesNotMatch, "The request signature we calculated does not match the signature you provided. Check your AWS secret access key and signing method.").
 -define(XML_ERROR_MSG_RequestTimeTooSkewed, "The difference between the request time and the server's time is too large.").
 -define(XML_ERROR_MSG_MetadataTooLarge, "Your metadata headers exceed the maximum allowed metadata size.").
+-define(XML_ERROR_MSG_InvalidPart, "One or more of the specified parts could not be found. The part might not have been uploaded, or the specified entity tag might not have matched the part's entity tag.").
+-define(XML_ERROR_MSG_NoSuchUpload, "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.").
 
 %% Macros
 %% - code:200
@@ -282,6 +289,11 @@
                          io_lib:format(?XML_ERROR, [?XML_ERROR_CODE_MetadataTooLarge,
                                                     ?XML_ERROR_MSG_MetadataTooLarge,
                                                     xmerl_lib:export_text(_Key), _ReqId]), _R)).
+-define(reply_upload_not_found(_H, _Key, _ReqId, _R),
+        cowboy_req:reply(?HTTP_ST_NOT_FOUND, _H,
+                         io_lib:format(?XML_ERROR, [?XML_ERROR_CODE_NoSuchUpload,
+                                                    ?XML_ERROR_MSG_NoSuchUpload,
+                                                    xmerl_lib:export_text(_Key), _ReqId]), _R)).
 
 -define(http_header(_R, _K),
         case cowboy_req:header(_K, _R) of
@@ -339,6 +351,20 @@
                       "<NextMarker>~s</NextMarker>",
                       "</ListBucketResult>"])).
 
+-define(XML_OBJ_VERSIONS_LIST,
+        lists:append(["<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                      "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                      "<Name>leofs</Name>",
+                      "<Prefix>~s</Prefix>",
+                      "<KeyMarker/>",
+                      "<VersionIdMarker/>",
+                      "<MaxKeys>~s</MaxKeys>",
+                      "<Delimiter>/</Delimiter>",
+                      "~s",
+                      "<IsTruncated>~s</IsTruncated>",
+                      "<NextKeyMarker>~s</NextKeyMarker>",
+                      "</ListVersionsResult>"])).
+
 -define(XML_OBJ_LIST_HEAD,
         lists:append(["<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                       "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
@@ -374,6 +400,21 @@
                       "<DisplayName>leofs</DisplayName>",
                       "</Owner>",
                       "</Contents>"])).
+
+-define(XML_OBJ_LIST_FILE_3,
+        lists:append(["<Version>",
+                      "<Key>~s~s</Key>",
+                      "<VersionId>1</VersionId>",
+                      "<IsLatest>true</IsLatest>",
+                      "<LastModified>~s</LastModified>",
+                      "<ETag>~s</ETag>",
+                      "<Size>~s</Size>",
+                      "<StorageClass>STANDARD</StorageClass>",
+                      "<Owner>",
+                      "<ID>leofs</ID>",
+                      "<DisplayName>leofs</DisplayName>",
+                      "</Owner>",
+                      "</Version>"])).
 
 -define(XML_OBJ_LIST_FOOT,
         lists:append(["<IsTruncated>~s</IsTruncated>",
@@ -563,6 +604,7 @@
           is_upload = false            :: boolean(),            %% is upload operation? (for multipart upload)
           is_aws_chunked = false       :: boolean(),            %% is AWS Chunked? (Signature V4)
           is_acl = false               :: boolean(),            %% is acl operation?
+          is_tagging = false           :: boolean(),            %% is tagging operation?
           ia_location = false          :: boolean(),            %% is location operation?
           upload_id = <<>>             :: binary(),             %% upload id for multipart upload
           upload_part_num = 0          :: non_neg_integer(),    %% upload part number for multipart upload

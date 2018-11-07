@@ -2,7 +2,7 @@
 %%
 %% LeoStorage
 %%
-%% Copyright (c) 2012-2017 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -333,6 +333,8 @@ insert_messages(From, MQId, Type, Directory, EnqueuedAt) ->
 
     DirTrailingSlash = case binary:last(Directory) of
         $/ ->
+            Directory;
+        $\n ->
             Directory;
         _ ->
             << Directory/binary, "/" >>

@@ -1,8 +1,8 @@
 %%======================================================================
 %%
-%% Leo S3 Handler
+%% Leo Gateway
 %%
-%% Copyright (c) 2012-2015 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -53,7 +53,7 @@
                    handle_multi_upload_3/3,
                    gen_upload_key/1, gen_upload_initiate_xml/3, gen_upload_completion_xml/4,
                    resp_copy_obj_xml/2, request_params/2, auth/5, auth/7, auth_1/7,
-                   get_bucket_1/6, put_bucket_1/3, delete_bucket_1/2, head_bucket_1/2
+                   get_bucket_1/7, put_bucket_1/3, delete_bucket_1/2, head_bucket_1/2
                   ]}).
 
 
@@ -283,6 +283,11 @@ get_bucket(Req, Key, #req_params{access_key_id = AccessKeyId,
                         true
                 end,
 
+    Versions = case cowboy_req:qs_val(?HTTP_QS_BIN_VERSIONS, Req) of
+                    {undefined, _} -> false;
+                    {_Val_4, _} ->
+                        true
+                end,
     case Versioning of
         true ->
             ?access_log_bucket_get(Key, PrefixBin, ?HTTP_ST_OK, BeginTime),
@@ -290,7 +295,7 @@ get_bucket(Req, Key, #req_params{access_key_id = AccessKeyId,
                       {?HTTP_HEAD_RESP_CONTENT_TYPE, ?HTTP_CTYPE_XML}],
             ?reply_ok(Header, ?XML_BUCKET_VERSIONING, Req);
         false ->
-            case get_bucket_1(AccessKeyId, Key, Delimiter, NormalizedMarker, MaxKeys, Prefix) of
+            case get_bucket_1(AccessKeyId, Key, Delimiter, NormalizedMarker, MaxKeys, Prefix, Versions) of
                 {ok, XMLRet} ->
                     ?access_log_bucket_get(Key, PrefixBin, ?HTTP_ST_OK, BeginTime),
                     Header = [?SERVER_HEADER,
@@ -541,6 +546,10 @@ put_object(Req, _Key, #req_params{is_acl = true} = _Params) ->
     %% return 501 otherwise.
     %% However it's hard to maintain so we go for the former approach as other NOT_IMPLEMENTED API do.
     ?reply_ok([?SERVER_HEADER], Req);
+
+put_object(Req, _Key, #req_params{is_tagging = true} = _Params) ->
+    %% Not implemented yet.
+    ?reply_not_implemented_without_body([?SERVER_HEADER], Req);
 
 put_object(Req, Key, Params) ->
     put_object(get_x_amz_meta_directive(Req), Req, Key, Params).
@@ -804,6 +813,12 @@ handle_1(Req, [{NumOfMinLayers, NumOfMaxLayers},
                 _ ->
                     true
             end,
+    IsTagging = case cowboy_req:qs_val(?HTTP_QS_BIN_TAGGING, Req_2) of
+                    {undefined, _} ->
+                        false;
+                    _ ->
+                        true
+                end,
     ReqParams = request_params(Req_2,
                                #req_params{
                                   handler = ?MODULE,
@@ -818,6 +833,7 @@ handle_1(Req, [{NumOfMinLayers, NumOfMaxLayers},
                                   is_cached = true,
                                   is_dir = IsDir,
                                   is_acl = IsACL,
+                                  is_tagging = IsTagging,
                                   max_chunked_objs = Props#http_options.max_chunked_objs,
                                   max_len_of_obj = Props#http_options.max_len_of_obj,
                                   chunked_obj_len = Props#http_options.chunked_obj_len,
@@ -1248,7 +1264,7 @@ handle_multi_upload_1(true, Req, Path, UploadId,
             _ = leo_gateway_rpc_handler:delete(Path4Conf),
             {ok, Req2};
         _ ->
-            ?reply_service_unavailable_error([?SERVER_HEADER], Path, <<>>, Req)
+            ?reply_upload_not_found([?SERVER_HEADER], Path, <<>>, Req)
     end;
 handle_multi_upload_1(false, Req, Path,_UploadId,_ChunkedLen,_,_,_) ->
     ?reply_service_unavailable_error([?SERVER_HEADER], Path, <<>>, Req).
@@ -1312,6 +1328,9 @@ handle_multi_upload_2({ok, Bin, Req}, _Req, Path,_ChunkedLen, BucketInfo, CMetaB
                            [{key, binary_to_list(Path)}, {cause, Error}]),
                     ?reply_internal_error([?SERVER_HEADER], Path, <<>>, Req)
             end;
+        {error, not_found} ->
+            ?reply_bad_request([?SERVER_HEADER], ?XML_ERROR_CODE_InvalidPart,
+                                ?XML_ERROR_MSG_InvalidPart, Path, <<>>, Req);
         {error, unavailable} ->
             ?reply_service_unavailable_error([?SERVER_HEADER], Path, <<>>, Req);
         {error, Cause} ->
@@ -1686,18 +1705,19 @@ auth_1(Req, HTTPMethod, Path, TokenLen, BucketName, _ACLs, #req_params{is_acl = 
 %% @doc Get bucket list
 %% @private
 %% @see http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGET.html
--spec(get_bucket_1(AccessKeyId, Key, Delimiter, Marker, MaxKeys, Prefix) ->
+-spec(get_bucket_1(AccessKeyId, Key, Delimiter, Marker, MaxKeys, Prefix, Versions) ->
              {ok, XMLRet} | {error, Cause} when AccessKeyId::binary(),
                                                 Key::binary(),
                                                 Delimiter::binary(),
                                                 Marker::binary(),
                                                 MaxKeys::non_neg_integer(),
                                                 Prefix::binary()|none,
+                                                Versions::boolean(),
                                                 XMLRet::binary(),
                                                 Cause::any()).
-get_bucket_1(AccessKeyId, <<>>, Delimiter, Marker, MaxKeys, none) ->
-    get_bucket_1(AccessKeyId, ?BIN_SLASH, Delimiter, Marker, MaxKeys, none);
-get_bucket_1(AccessKeyId, ?BIN_SLASH, _Delimiter, _Marker, _MaxKeys, none) ->
+get_bucket_1(AccessKeyId, <<>>, Delimiter, Marker, MaxKeys, none, _Versions) ->
+    get_bucket_1(AccessKeyId, ?BIN_SLASH, Delimiter, Marker, MaxKeys, none, _Versions);
+get_bucket_1(AccessKeyId, ?BIN_SLASH, _Delimiter, _Marker, _MaxKeys, none, _Versions) ->
     case leo_s3_bucket:find_buckets_by_id(AccessKeyId) of
         not_found ->
             {ok, generate_bucket_xml([])};
@@ -1708,7 +1728,7 @@ get_bucket_1(AccessKeyId, ?BIN_SLASH, _Delimiter, _Marker, _MaxKeys, none) ->
         Error ->
             Error
     end;
-get_bucket_1(_AccessKeyId, BucketName, _Delimiter, _Marker, 0, Prefix) ->
+get_bucket_1(_AccessKeyId, BucketName, _Delimiter, _Marker, 0, Prefix, _Versions) ->
     Prefix_1 = case Prefix of
                    none ->
                        <<>>;
@@ -1717,7 +1737,7 @@ get_bucket_1(_AccessKeyId, BucketName, _Delimiter, _Marker, 0, Prefix) ->
                end,
     Path = << BucketName/binary, Prefix_1/binary >>,
     {ok, generate_bucket_xml(Path, Prefix_1, [], 0)};
-get_bucket_1(_AccessKeyId, BucketName, none, Marker, MaxKeys, Prefix) ->
+get_bucket_1(_AccessKeyId, BucketName, none, Marker, MaxKeys, Prefix, _Versions) ->
     ?debug("get_bucket_1/6", "BucketName: ~p, Marker: ~p, MaxKeys: ~p, Prefix: ~p",
            [BucketName, Marker, MaxKeys, Prefix]),
     Prefix_1 = case Prefix of
@@ -1753,7 +1773,38 @@ get_bucket_1(_AccessKeyId, BucketName, none, Marker, MaxKeys, Prefix) ->
         Error ->
             Error
     end;
-get_bucket_1(_AccessKeyId, BucketName, Delimiter, Marker, MaxKeys, Prefix) ->
+get_bucket_1(_AccessKeyId, BucketName, Delimiter, Marker, MaxKeys, Prefix, true) ->
+    ?debug("get_bucket_1/6", "BucketName: ~p, Delimiter: ~p, Marker: ~p, MaxKeys: ~p, Prefix: ~p",
+           [BucketName, Delimiter, Marker, MaxKeys, Prefix]),
+
+    Prefix_1 = case Prefix of
+                   none ->
+                       <<>>;
+                   true ->
+                       <<>>;
+                   _ ->
+                       Prefix
+               end,
+
+    {ok, #redundancies{nodes = Redundancies}} =
+        leo_redundant_manager_api:get_redundancies_by_key(get, BucketName),
+    Path = << BucketName/binary, Prefix_1/binary >>,
+
+    case leo_gateway_rpc_handler:invoke(Redundancies,
+                                        leo_storage_handler_directory,
+                                        find_by_parent_dir,
+                                        [Path, Delimiter, Marker, MaxKeys],
+                                        []) of
+        not_found ->
+            {ok, generate_bucket_obj_versions_xml(Path, Prefix_1, [], MaxKeys)};
+        {ok, []} ->
+            {ok, generate_bucket_obj_versions_xml(Path, Prefix_1, [], MaxKeys)};
+        {ok, MetadataL} ->
+            {ok, generate_bucket_obj_versions_xml(Path, Prefix_1, MetadataL, MaxKeys)};
+        Error ->
+            Error
+    end;
+get_bucket_1(_AccessKeyId, BucketName, Delimiter, Marker, MaxKeys, Prefix, false) ->
     ?debug("get_bucket_1/6", "BucketName: ~p, Delimiter: ~p, Marker: ~p, MaxKeys: ~p, Prefix: ~p",
            [BucketName, Delimiter, Marker, MaxKeys, Prefix]),
 
@@ -1994,6 +2045,107 @@ generate_bucket_xml_loop(Ref, TotalDivs, CallbackFun, Acc) ->
             {error, timeout}
     end.
 
+%% @doc Generate BucketGETVersion XML from matadata-list
+%% @private
+-spec(generate_bucket_obj_versions_xml(PathBin, PrefixBin, MetadataL, MaxKeys) ->
+             XMLRet when PathBin::binary(),
+                         PrefixBin::binary(),
+                         MetadataL::[#?METADATA{}],
+                         MaxKeys::binary(),
+                         XMLRet::string()).
+generate_bucket_obj_versions_xml(PathBin, PrefixBin, MetadataL, MaxKeys) ->
+    PathLen = byte_size(PathBin),
+    Path = binary_to_list(PathBin),
+    Prefix = binary_to_list(PrefixBin),
+
+    Ref = make_ref(),
+    ok = generate_bucket_obj_versions_xml_1(MetadataL, 1, Ref, PathLen, Path, Prefix, MaxKeys),
+
+    TotalDivs = leo_math:ceiling(length(MetadataL) / ?DEF_MAX_NUM_OF_METADATAS),
+    CallbackFun = fun(XMLList, NextMarker) ->
+                          TruncatedStr = atom_to_list(length(MetadataL) =:= MaxKeys andalso MaxKeys =/= 0),
+                          io_lib:format(?XML_OBJ_VERSIONS_LIST,
+                                        [xmerl_lib:export_text(Prefix),
+                                         integer_to_list(MaxKeys),
+                                         XMLList,
+                                         TruncatedStr,
+                                         xmerl_lib:export_text(NextMarker)])
+                  end,
+    generate_bucket_obj_versions_xml_loop(Ref, TotalDivs, CallbackFun, []).
+
+%% @private
+generate_bucket_obj_versions_xml_1([],_Index,_Ref,_PathLen,_Path,_Prefix,_MaxKeys) ->
+    ok;
+generate_bucket_obj_versions_xml_1(MetadataL, Index, Ref, PathLen, Path, Prefix, MaxKeys) ->
+    {MetadataL_1, Rest} =
+        case (length(MetadataL) >= ?DEF_MAX_NUM_OF_METADATAS) of
+            true ->
+                lists:split(?DEF_MAX_NUM_OF_METADATAS, MetadataL);
+            false ->
+                {MetadataL, []}
+        end,
+
+    PId = self(),
+    spawn(fun() ->
+                  Fun = fun(#?METADATA{key = EntryKeyBin,
+                                       dsize = DSize,
+                                       timestamp = Timestamp,
+                                       checksum = Checksum,
+                                       del = 0}, {Acc,_NextMarker}) ->
+                                EntryKey = binary_to_list(EntryKeyBin),
+
+                                case string:equal(Path, EntryKey) of
+                                    true ->
+                                        {Acc,_NextMarker};
+                                    false ->
+                                        Entry = string:sub_string(EntryKey, PathLen + 1),
+                                        case (DSize == -1) of
+                                            %% directory
+                                            true ->
+                                                {lists:append(
+                                                   [Acc,
+                                                    io_lib:format(?XML_DIR_PREFIX,
+                                                                  [xmerl_lib:export_text(Prefix),
+                                                                   xmerl_lib:export_text(Entry)])]),
+                                                 EntryKeyBin};
+                                            %% object
+                                            false ->
+                                                {lists:append(
+                                                   [Acc,
+                                                    io_lib:format(?XML_OBJ_LIST_FILE_3,
+                                                                  [xmerl_lib:export_text(Prefix),
+                                                                   xmerl_lib:export_text(Entry),
+                                                                   leo_http:web_date(Timestamp),
+                                                                   leo_hex:integer_to_hex(Checksum, 32),
+                                                                   integer_to_list(DSize)])]),
+                                                 EntryKeyBin}
+                                        end
+                                end
+                        end,
+                  {XMLList, NextMarker} = lists:foldl(Fun, {[], <<>>}, MetadataL_1),
+                  erlang:send(PId, {append, Ref, {Index, XMLList, NextMarker}})
+          end),
+    generate_bucket_obj_versions_xml_1(Rest, Index + 1, Ref, PathLen, Path, Prefix, MaxKeys).
+
+
+%% @private
+generate_bucket_obj_versions_xml_loop(_Ref, 0, CallbackFun, Acc) ->
+    {XMLList_1, NextMarker_1} =
+        lists:foldl(fun({_Index, XMLList, NextMarker}, {SoFar,_}) ->
+                            {lists:append([SoFar, XMLList]), NextMarker}
+                    end, {[], []}, lists:sort(Acc)),
+    CallbackFun(XMLList_1, NextMarker_1);
+generate_bucket_obj_versions_xml_loop(Ref, TotalDivs, CallbackFun, Acc) ->
+    receive
+        {append, Ref, {Index, XMLList, NextMarker}} ->
+            generate_bucket_obj_versions_xml_loop(Ref, TotalDivs - 1,
+                                     CallbackFun, [{Index, XMLList, NextMarker}|Acc]);
+        _ ->
+            generate_bucket_obj_versions_xml_loop(Ref, TotalDivs, CallbackFun, Acc)
+    after
+        ?DEF_REQ_TIMEOUT ->
+            {error, timeout}
+    end.
 
 
 %% @doc Generate XML from ACL

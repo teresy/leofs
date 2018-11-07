@@ -1,8 +1,8 @@
 %%======================================================================
 %%
-%% Network Lock Manager written in Erlang
+%% Leo Gateway / Network Lock Manager written in Erlang
 %%
-%% Copyright (c) 2012-2015 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -95,7 +95,7 @@ handle_call({unlock, FileHandler, Owner, Start, End}, _From, State) ->
                                                    [] ->
                                                        Acc;
                                                    Modified ->
-                                                       lists:append(Acc, Modified)
+                                                       Acc ++ Modified
                                                end;
                                            _ ->
                                                [CurLock | Acc]

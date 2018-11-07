@@ -2,7 +2,7 @@
 %%
 %% LeoManager
 %%
-%% Copyright (c) 2012-2017 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -565,6 +565,8 @@ handle_call(_Socket, <<?CMD_GET_BUCKET_BY_ACCESS_KEY, ?SPACE, Option/binary>>,
                   case get_bucket_by_access_key(Option) of
                       {ok, Buckets} ->
                           Formatter:bucket_by_access_key(Buckets);
+                      not_found when Formatter =:= leo_manager_formatter_json ->
+                          Formatter:bucket_by_access_key([]);
                       not_found ->
                           Formatter:error("Bucket not found");
                       {error, Cause} ->
@@ -1591,18 +1593,23 @@ status(node_list) ->
                      {ok, R1} ->
                          lists:map(fun(N) ->
                                            Node = N#node_state.node,
-                                           State = case leo_redundant_manager_api:get_member_by_node(Node) of
-                                                       {ok, #member{state = State_1}} ->
-                                                           State_1;
-                                                       _ ->
-                                                           error
-                                                   end,
-                                           {?SERVER_TYPE_STORAGE,
-                                            atom_to_list(Node),
-                                            atom_to_list(State),
-                                            N#node_state.ring_hash_new,
-                                            N#node_state.ring_hash_old,
-                                            N#node_state.when_is}
+                                           {State, RackId} =
+                                               case leo_redundant_manager_api:get_member_by_node(Node) of
+                                                   {ok, #member{state = State_1,
+                                                                grp_level_2 = RackId_1}} ->
+                                                       {State_1, RackId_1};
+                                                   _ ->
+                                                       error
+                                               end,
+                                           #node_state_for_output{
+                                              node = atom_to_list(Node),
+                                              type = ?SERVER_TYPE_STORAGE,
+                                              state = atom_to_list(State),
+                                              rack_id = RackId,
+                                              ring_hash_new = N#node_state.ring_hash_new,
+                                              ring_hash_old = N#node_state.ring_hash_old,
+                                              when_is = N#node_state.when_is
+                                             }
                                    end, R1);
                      _ ->
                          []
@@ -1610,12 +1617,14 @@ status(node_list) ->
             S2 = case leo_manager_mnesia:get_gateway_nodes_all() of
                      {ok, R2} ->
                          lists:map(fun(N) ->
-                                           {?SERVER_TYPE_GATEWAY,
-                                            atom_to_list(N#node_state.node),
-                                            atom_to_list(N#node_state.state),
-                                            N#node_state.ring_hash_new,
-                                            N#node_state.ring_hash_old,
-                                            N#node_state.when_is}
+                                           #node_state_for_output{
+                                              node = atom_to_list(N#node_state.node),
+                                              type = ?SERVER_TYPE_GATEWAY,
+                                              state = atom_to_list(N#node_state.state),
+                                              ring_hash_new = N#node_state.ring_hash_new,
+                                              ring_hash_old = N#node_state.ring_hash_old,
+                                              when_is = N#node_state.when_is
+                                             }
                                    end, R2);
                      _ ->
                          []
@@ -2099,22 +2108,10 @@ create_user(Option) ->
           end,
 
     case Ret of
-        {ok, {Arg0, Arg1}} ->
-            case leo_s3_user:put(Arg0, Arg1, true) of
+        {ok, {UserId_1, Password_1}} ->
+            case leo_s3_user:create(UserId_1, Password_1) of
                 {ok, Keys} ->
-                    AccessKeyId     = leo_misc:get_value(access_key_id,     Keys),
-                    SecretAccessKey = leo_misc:get_value(secret_access_key, Keys),
-
-                    case Arg1 of
-                        <<>> ->
-                            ok = leo_s3_user:update(#?S3_USER{id       = Arg0,
-                                                              role_id  = ?ROLE_GENERAL,
-                                                              password = SecretAccessKey});
-                        _ ->
-                            void
-                    end,
-                    {ok, [{access_key_id,     AccessKeyId},
-                          {secret_access_key, SecretAccessKey}]};
+                    {ok, Keys};
                 {error,_Cause} ->
                     {error, ?ERROR_COULD_NOT_ADD_USER}
             end;
@@ -2144,19 +2141,12 @@ import_user(Option) ->
               Error ->
                   Error
           end,
+
     case Ret of
         {ok, {false, UserId_1, AccessKey_1, SecretKey_1}} ->
             case leo_s3_user:import(UserId_1, AccessKey_1, SecretKey_1) of
                 {ok, Keys} ->
-                    AccessKeyId     = leo_misc:get_value(access_key_id,     Keys),
-                    SecretAccessKey = leo_misc:get_value(secret_access_key, Keys),
-
-                    ok = leo_s3_user:update(#?S3_USER{id = UserId_1,
-                                                      role_id = ?ROLE_GENERAL,
-                                                      password = SecretAccessKey}),
-
-                    {ok, [{access_key_id,     AccessKeyId},
-                          {secret_access_key, SecretAccessKey}]};
+                    {ok, Keys};
 
                 %% User ID or Access Key ID Already Exists
                 {error, already_exists} ->
@@ -2167,10 +2157,7 @@ import_user(Option) ->
         {ok, {true, UserId_1, AccessKey_1, SecretKey_1}} ->
             case leo_s3_user:force_import(UserId_1, AccessKey_1, SecretKey_1) of
                 {ok, Keys} ->
-                    AccessKeyId     = leo_misc:get_value(access_key_id,     Keys),
-                    SecretAccessKey = leo_misc:get_value(secret_access_key, Keys),
-                    {ok, [{access_key_id,     AccessKeyId},
-                          {secret_access_key, SecretAccessKey}]};
+                    {ok, Keys};
                 {error, already_exists} ->
                     {error, already_exists};
                 {error,_Cause} ->
@@ -2255,6 +2242,8 @@ get_users(Formatter) ->
                   case get_users_1() of
                       {ok, List} ->
                           Formatter:users(List);
+                      {error, not_found} when Formatter =:= leo_manager_formatter_json ->
+                          Formatter:users([]);
                       {error, Cause} ->
                           Formatter:error(Cause)
                   end
@@ -2297,6 +2286,8 @@ get_endpoints(Formatter) ->
                   case get_endpoints_1() of
                       {ok, EndPoints} ->
                           Formatter:endpoints(EndPoints);
+                      {error, ?ERROR_ENDPOINT_NOT_FOUND} when Formatter =:= leo_manager_formatter_json ->
+                          Formatter:endpoints([]);
                       {error, Cause} ->
                           Formatter:error(Cause)
                   end
@@ -2425,6 +2416,8 @@ get_buckets(Formatter) ->
                   case get_buckets_1() of
                       {ok, Buckets} ->
                           Formatter:buckets(Buckets);
+                      {error, ?ERROR_BUCKET_NOT_FOUND} when Formatter =:= leo_manager_formatter_json ->
+                          Formatter:buckets([]);
                       {error, Cause} ->
                           Formatter:error(Cause)
                   end

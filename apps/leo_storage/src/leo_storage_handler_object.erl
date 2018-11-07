@@ -2,7 +2,7 @@
 %%
 %% LeoStorage
 %%
-%% Copyright (c) 2012-2017 Rakuten, Inc.
+%% Copyright (c) 2012-2018 Rakuten, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -41,6 +41,7 @@
          delete_objects_under_dir/1,
          head/2, head/3,
          head_with_calc_md5/3,
+         get_chunked_object_key_list/2,
          replicate/1, replicate/3,
          prefix_search/3, prefix_search_and_remove_objects/3,
          find_uploaded_objects_by_key/1,
@@ -328,7 +329,7 @@ get_fun(AddrId, Key, StartPos, EndPos, IsForcedCheck) ->
                                       Cause::any()).
 put({Object, Ref}) ->
     AddrId = Object#?OBJECT.addr_id,
-    Key    = Object#?OBJECT.key,
+    Key = Object#?OBJECT.key,
 
     case Object#?OBJECT.del of
         ?DEL_TRUE->
@@ -486,7 +487,7 @@ delete_chunked_objects(0,_) ->
     ok;
 delete_chunked_objects(CIndex, ParentKey) ->
     IndexBin = list_to_binary(integer_to_list(CIndex)),
-    Key    = << ParentKey/binary, "\n", IndexBin/binary >>,
+    Key = << ParentKey/binary, "\n", IndexBin/binary >>,
     AddrId = leo_redundant_manager_chash:vnode_id(Key),
 
     case leo_storage_handler_object:head(AddrId, Key) of
@@ -538,7 +539,7 @@ delete_chunked_objects(CIndex, ParentKey) ->
                                       Cause::any()).
 delete({Object, Ref}) ->
     AddrId = Object#?OBJECT.addr_id,
-    Key    = Object#?OBJECT.key,
+    Key = Object#?OBJECT.key,
 
     case leo_object_storage_api:head({AddrId, Key}) of
         {ok, MetaBin} ->
@@ -763,6 +764,48 @@ head_1([_|Rest], AddrId, Key) ->
 head_with_calc_md5(AddrId, Key, MD5Context) ->
     leo_object_storage_api:head_with_calc_md5({AddrId, Key}, MD5Context).
 
+%%--------------------------------------------------------------------
+%% API - Get chunked object key list
+%%--------------------------------------------------------------------
+%% @doc Get chunked object key list from the object-storage
+-spec(get_chunked_object_key_list(AddrId, Key) ->
+             {ok, list(binary())} | {error, Cause} when AddrId::integer(),
+                                                        Key::binary(),
+                                                        Cause::any()).
+get_chunked_object_key_list(AddrId, Key) ->
+    case leo_storage_handler_object:head(AddrId, Key) of
+        {ok, #?METADATA{cnumber = 0}} ->
+            {ok, [Key]};
+        {ok, #?METADATA{cnumber = CNumber}} ->
+            get_chunked_object_key_list(CNumber, Key, [Key]);
+        not_found = Cause ->
+            {error, Cause};
+        {error, Cause} ->
+            {error, Cause}
+    end.
+
+get_chunked_object_key_list(0, _, Acc) ->
+    {ok, Acc};
+get_chunked_object_key_list(CIndex, ParentKey, Acc) ->
+    IndexBin = list_to_binary(integer_to_list(CIndex)),
+    Key = << ParentKey/binary, "\n", IndexBin/binary >>,
+    AddrId = leo_redundant_manager_chash:vnode_id(Key),
+
+    case leo_storage_handler_object:head(AddrId, Key) of
+        {ok, #?METADATA{cnumber = 0}} ->
+            get_chunked_object_key_list(CIndex - 1, ParentKey, [Key|Acc]);
+        {ok, #?METADATA{cnumber = CNumber}} ->
+            case get_chunked_object_key_list(CNumber, Key, Acc) of
+                {ok, Acc1} ->
+                    get_chunked_object_key_list(CIndex - 1, ParentKey, [Key|Acc1]);
+                {error, Cause} ->
+                    {error, Cause}
+            end;
+        not_found = Cause->
+            {error, Cause};
+        {error, Cause} ->
+            {error, Cause}
+    end.
 
 %%--------------------------------------------------------------------
 %% API - COPY/STACK-SEND/RECEIVE-STORE
@@ -1544,6 +1587,37 @@ get_cmeta_test() ->
 -endif.
 
 %% @doc PUT an object having inconsistencies for test/debug
+%%      This API provides callers with the fine-grained controll on which replica is created.
+debug_put(Key, Body, ReplicaState) when is_list(ReplicaState) ->
+    case leo_redundant_manager_api:get_redundancies_by_key(put, Key) of
+        {ok, #redundancies{nodes = Redundancies,
+                              id = AddrId,
+                               n = NumOfReplicasOrg,
+                               ring_hash = RingHash}} ->
+            case length(ReplicaState) =/= NumOfReplicasOrg of
+                true ->
+                    {error, different_num_of_replicas};
+                false ->
+                    L = lists:zip(ReplicaState, Redundancies),
+                    Redundancies2 = [R || {ToCreate, R} <- L, ToCreate =:= true],
+                    Quorum = ?quorum(?CMD_PUT, length(Redundancies2), length(Redundancies2)),
+                    Object = #?OBJECT{method = ?CMD_PUT,
+                                      addr_id = AddrId,
+                                      key = Key,
+                                      data = Body,
+                                      dsize = size(Body),
+                                      timestamp = leo_date:now(),
+                                      clock = leo_date:clock(),
+                                      ring_hash = RingHash},
+                    leo_storage_replicator:replicate(
+                        ?CMD_PUT, Quorum, Redundancies2,
+                        Object,
+                        replicate_callback(Object))
+            end;
+        {error, Cause} ->
+            {error, Cause}
+    end;
+%% @doc PUT an object having inconsistencies for test/debug
 debug_put(Key, Body, NumOfReplicas) ->
     case leo_redundant_manager_api:get_redundancies_by_key(put, Key) of
         {ok, #redundancies{nodes = Redundancies,
@@ -1574,6 +1648,38 @@ debug_put(Key, Body, NumOfReplicas) ->
             {error, Cause}
     end.
 
+%% @doc DELETE an object having inconsistencies for test/debug
+%%      This API provides callers with the fine-grained controll on which replica is deleted.
+debug_delete(Key, ReplicaState) when is_list(ReplicaState) ->
+    case leo_redundant_manager_api:get_redundancies_by_key(delete, Key) of
+        {ok, #redundancies{nodes = Redundancies,
+                              id = AddrId,
+                               n = NumOfReplicasOrg,
+                               ring_hash = RingHash}} ->
+            case length(ReplicaState) =/= NumOfReplicasOrg of
+                true ->
+                    {error, different_num_of_replicas};
+                false ->
+                    L = lists:zip(ReplicaState, Redundancies),
+                    Redundancies2 = [R || {ToCreate, R} <- L, ToCreate =:= true],
+                    Quorum = ?quorum(?CMD_DELETE, length(Redundancies2), length(Redundancies2)),
+                    Object = #?OBJECT{method = ?CMD_DELETE,
+                                      addr_id = AddrId,
+                                      key = Key,
+                                      data = <<>>,
+                                      dsize = 0,
+                                      timestamp = leo_date:now(),
+                                      clock = leo_date:clock(),
+                                      ring_hash = RingHash,
+                                      del = ?DEL_TRUE},
+                    leo_storage_replicator:replicate(
+                        ?CMD_DELETE, Quorum, Redundancies2,
+                        Object,
+                        replicate_callback(Object))
+            end;
+        {error, Cause} ->
+            {error, Cause}
+    end;
 %% @doc DELETE an object having inconsistencies for test/debug
 debug_delete(Key, NumOfReplicas) ->
     case leo_redundant_manager_api:get_redundancies_by_key(delete, Key) of
